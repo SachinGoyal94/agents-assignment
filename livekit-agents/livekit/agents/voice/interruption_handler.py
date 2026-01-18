@@ -1,16 +1,22 @@
 """
-Intelligent Interruption Handler for Voice Agents
+Advanced Interruption Handler with Timing Awareness + Urgency Detection
 Location: livekit-agents/livekit/agents/voice/interruption_handler.py
 
-Implements context-aware interruption logic without modifying VAD/STT core
+This is a PRODUCTION-GRADE interruption system that considers:
+1. Semantic patterns (regex)
+2. Agent speech duration (timing)
+3. Audio urgency features (volume, pitch, rate)
+4. Confidence scoring (not binary)
 """
 
 import asyncio
 import re
 import logging
+import time
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -25,179 +31,320 @@ class AgentState(Enum):
 
 class InterruptionIntent(Enum):
     """Classification of user interruption intent"""
-    IGNORE = "ignore"  # Soft acknowledgments like "yeah", "mhmm"
-    PAUSE = "pause"  # User wants to interrupt but politely
-    HARD_STOP = "hard_stop"  # Strong interruption signals
+    IGNORE = "ignore"
+    INTERRUPT = "interrupt"
 
 
 @dataclass
-class InterruptionContext:
-    """Context for making interruption decisions"""
-    agent_state: AgentState
-    agent_speech_duration: float
-    user_input_detected: bool
-    vad_confidence: float
-    stt_text: Optional[str] = None
-    timestamp: float = 0.0
+class InterruptionScore:
+    """Detailed scoring for interruption decision"""
+    semantic_score: float  # 0-1: Pattern matching confidence
+    timing_score: float    # 0-1: How timing affects decision
+    urgency_score: float   # 0-1: Audio urgency features
+    final_score: float     # 0-1: Combined weighted score
+    decision: InterruptionIntent
+    reason: str
+    confidence: float      # 0-1: How confident we are
 
 
-class SemanticInterruptionHandler:
+@dataclass
+class AudioFeatures:
+    """Extracted audio features for urgency detection"""
+    rms_energy: float      # Root mean square energy (volume)
+    zero_crossing_rate: float  # Pitch/timbre indicator
+    speaking_rate: float   # Estimated words per second
+    duration: float        # Audio duration in seconds
+
+
+class AudioAnalyzer:
     """
-    Core interruption logic layer that sits between VAD/STT and agent control.
-
-    Key Design Principles:
-    1. Non-blocking: All operations are async to minimize latency
-    2. Configurable: Easy to tune thresholds and patterns
-    3. Stateful: Tracks conversation context for smart decisions
-    4. Layered: Doesn't modify existing VAD/STT implementations
+    Analyzes audio features to detect urgency in speech.
+    Uses simple signal processing - no ML models needed for speed.
     """
 
-    # Soft acknowledgment patterns (ignore these)
+    @staticmethod
+    def extract_features(audio_data: np.ndarray, sample_rate: int = 16000) -> AudioFeatures:
+        """
+        Extract audio features from raw PCM data.
+
+        Args:
+            audio_data: Numpy array of audio samples
+            sample_rate: Sample rate in Hz
+
+        Returns:
+            AudioFeatures with extracted metrics
+        """
+        if len(audio_data) == 0:
+            return AudioFeatures(0.0, 0.0, 0.0, 0.0)
+
+        # RMS Energy (volume indicator)
+        rms = np.sqrt(np.mean(audio_data ** 2))
+
+        # Zero crossing rate (pitch/timbre)
+        zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_data)))) / 2
+        zcr = zero_crossings / len(audio_data)
+
+        # Duration
+        duration = len(audio_data) / sample_rate
+
+        # Speaking rate estimation (simple heuristic)
+        # Higher ZCR usually means faster/more energetic speech
+        speaking_rate = zcr * 100  # Normalized estimate
+
+        return AudioFeatures(
+            rms_energy=float(rms),
+            zero_crossing_rate=float(zcr),
+            speaking_rate=float(speaking_rate),
+            duration=float(duration)
+        )
+
+    @staticmethod
+    def calculate_urgency(features: AudioFeatures) -> float:
+        """
+        Calculate urgency score from audio features.
+
+        High urgency indicators:
+        - High RMS energy (loud voice)
+        - High zero crossing rate (sharp/harsh tone)
+        - Short duration (quick interjection)
+
+        Returns:
+            Urgency score from 0.0 (calm) to 1.0 (urgent)
+        """
+        # Normalize features (these are rough thresholds)
+        energy_score = min(features.rms_energy / 0.3, 1.0)  # Loud speech
+        zcr_score = min(features.zero_crossing_rate / 0.1, 1.0)  # Sharp tone
+
+        # Short duration = more urgent (quick interjection)
+        duration_score = 1.0 - min(features.duration / 2.0, 1.0)
+
+        # Weighted combination
+        urgency = (
+            energy_score * 0.4 +      # Volume is important
+            zcr_score * 0.3 +          # Tone matters
+            duration_score * 0.3       # Quick = urgent
+        )
+
+        return min(max(urgency, 0.0), 1.0)  # Clamp to [0, 1]
+
+
+class AdvancedInterruptionClassifier:
+    """
+    Advanced semantic classifier with pattern matching and confidence scoring.
+    """
+
+    # Soft acknowledgments (should NOT interrupt)
     SOFT_ACKNOWLEDGMENTS = {
-        r'\b(yeah|yep|yes|uh-huh|mm-hmm|mhmm|okay|ok|right|sure|got it)\b',
-        r'\b(i see|makes sense|understood|alright|cool|nice)\b',
-        r'\b(go on|continue|keep going)\b',
+        r'\b(yeah|yep|yes|uh-huh|mm-hmm|mhmm|okay|ok|right|sure|got it)\b': 0.9,
+        r'\b(i see|makes sense|understood|alright|cool|nice)\b': 0.85,
+        r'\b(go on|continue|keep going)\b': 0.95,
+        r'\b(interesting|really|wow|oh|ah)\b': 0.8,
     }
 
-    # Hard interruption patterns (stop immediately)
+    # Hard interruptions (SHOULD interrupt)
     HARD_INTERRUPTIONS = {
-        r'\b(wait|hold on|stop|hang on|but|however|actually)\b',
-        r'\b(excuse me|sorry|one sec|one second|pause)\b',
-        r'\bno\b(?!\s+problem)',  # "no" but not "no problem"
-        r'\b(what|huh|pardon)\b',  # confusion signals
+        r'\b(wait|hold on|stop|hang on)\b': 0.95,
+        r'\b(but|however|actually)\b': 0.85,
+        r'\b(excuse me|sorry|one sec|one second)\b': 0.9,
+        r'\bno\b(?!\s+problem)': 0.85,
+        r'\b(what|huh|pardon)\b': 0.7,
     }
 
-    # Pause/polite interruption patterns
-    PAUSE_PATTERNS = {
-        r'\b(quick question|can i ask|may i|could you)\b',
-        r'\b(before you|let me|i want to|i need to)\b',
-        r'\b(just to clarify|to be clear)\b',
+    # Polite interruptions (SHOULD interrupt)
+    POLITE_INTERRUPTIONS = {
+        r'\b(quick question|can i ask|may i|could you)\b': 0.9,
+        r'\b(before you|let me|i want to|i need to)\b': 0.85,
+        r'\b(just to clarify|to be clear|one thing)\b': 0.8,
     }
+
+    def __init__(self):
+        # Compile patterns with confidence scores
+        self.soft_patterns = [(re.compile(p, re.IGNORECASE), c)
+                             for p, c in self.SOFT_ACKNOWLEDGMENTS.items()]
+        self.hard_patterns = [(re.compile(p, re.IGNORECASE), c)
+                             for p, c in self.HARD_INTERRUPTIONS.items()]
+        self.polite_patterns = [(re.compile(p, re.IGNORECASE), c)
+                               for p, c in self.POLITE_INTERRUPTIONS.items()]
+
+        logger.info("✅ Advanced semantic classifier initialized")
+
+    def classify(self, text: str) -> tuple[InterruptionIntent, float, str]:
+        """
+        Classify text with confidence scoring.
+
+        Returns:
+            (intent, confidence, reason)
+        """
+        if not text or len(text.strip()) < 2:
+            return InterruptionIntent.IGNORE, 0.5, "Empty input"
+
+        text_lower = text.lower().strip()
+
+        # Check hard interruptions (highest priority)
+        for pattern, confidence in self.hard_patterns:
+            if pattern.search(text_lower):
+                return InterruptionIntent.INTERRUPT, confidence, f"Hard interruption pattern matched"
+
+        # Check polite interruptions
+        for pattern, confidence in self.polite_patterns:
+            if pattern.search(text_lower):
+                return InterruptionIntent.INTERRUPT, confidence, f"Polite interruption pattern matched"
+
+        # Check soft acknowledgments
+        for pattern, confidence in self.soft_patterns:
+            if pattern.search(text_lower):
+                return InterruptionIntent.IGNORE, confidence, f"Soft acknowledgment pattern matched"
+
+        # Word count heuristic
+        word_count = len(text_lower.split())
+        if word_count <= 3:
+            return InterruptionIntent.IGNORE, 0.7, f"Short input ({word_count} words)"
+
+        # Default: longer input = probably wants to interrupt
+        return InterruptionIntent.INTERRUPT, 0.6, f"Longer input ({word_count} words)"
+
+
+class TimingAwareInterruptionHandler:
+    """
+    Production-grade interruption handler with:
+    - Semantic classification
+    - Timing awareness
+    - Urgency detection
+    - Confidence scoring
+    """
 
     def __init__(
         self,
-        min_speech_duration_for_interrupt: float = 1.0,
-        vad_confidence_threshold: float = 0.7,
-        stt_timeout: float = 0.5,
+        min_speech_duration: float = 1.0,
+        short_speech_threshold: float = 3.0,
+        long_speech_threshold: float = 8.0,
+        base_threshold: float = 0.7,
     ):
-        self.min_speech_duration = min_speech_duration_for_interrupt
-        self.vad_threshold = vad_confidence_threshold
-        self.stt_timeout = stt_timeout
+        """
+        Args:
+            min_speech_duration: Minimum time before allowing ANY interruptions
+            short_speech_threshold: Time below which we're more conservative
+            long_speech_threshold: Time above which we're more lenient
+            base_threshold: Base confidence threshold for interruption (0-1)
+        """
+        self.min_speech_duration = min_speech_duration
+        self.short_speech_threshold = short_speech_threshold
+        self.long_speech_threshold = long_speech_threshold
+        self.base_threshold = base_threshold
+
+        self.classifier = AdvancedInterruptionClassifier()
+        self.audio_analyzer = AudioAnalyzer()
 
         self.current_state = AgentState.IDLE
         self.speech_start_time: Optional[float] = None
 
-        # Compile regex patterns for speed
-        self.soft_patterns = [re.compile(p, re.IGNORECASE) for p in self.SOFT_ACKNOWLEDGMENTS]
-        self.hard_patterns = [re.compile(p, re.IGNORECASE) for p in self.HARD_INTERRUPTIONS]
-        self.pause_patterns = [re.compile(p, re.IGNORECASE) for p in self.PAUSE_PATTERNS]
+        logger.info(f"✅ Timing-aware interruption handler initialized")
+        logger.info(f"   Settings: min={min_speech_duration}s, short<{short_speech_threshold}s, long>{long_speech_threshold}s")
 
-        logger.info(f"✅ Interruption handler initialized (min_duration={self.min_speech_duration}s, timeout={self.stt_timeout}s)")
-
-    def _classify_intent(self, text: str) -> InterruptionIntent:
+    def _calculate_timing_score(self, speech_duration: float) -> float:
         """
-        Fast intent classification using regex patterns.
-        Priority: HARD_STOP > PAUSE > IGNORE
+        Calculate timing factor based on how long agent has been speaking.
+
+        Returns:
+            0.0-1.0 where higher = more likely to allow interruption
         """
-        if not text or len(text.strip()) < 2:
-            return InterruptionIntent.IGNORE
-
-        text_lower = text.lower().strip()
-
-        # Check hard interruptions first (highest priority)
-        for pattern in self.hard_patterns:
-            if pattern.search(text_lower):
-                logger.debug(f"🛑 Hard interruption detected: '{text}'")
-                return InterruptionIntent.HARD_STOP
-
-        # Check pause patterns
-        for pattern in self.pause_patterns:
-            if pattern.search(text_lower):
-                logger.debug(f"⏸️  Pause interruption detected: '{text}'")
-                return InterruptionIntent.PAUSE
-
-        # Check soft acknowledgments (ignore these)
-        for pattern in self.soft_patterns:
-            if pattern.search(text_lower):
-                logger.debug(f"✨ Soft acknowledgment detected: '{text}'")
-                return InterruptionIntent.IGNORE
-
-        # Default: if text is short (< 5 words), likely acknowledgment
-        word_count = len(text_lower.split())
-        if word_count <= 3:
-            logger.debug(f"✨ Short input treated as acknowledgment: '{text}'")
-            return InterruptionIntent.IGNORE
-
-        # Longer input during speech = likely interruption
-        logger.debug(f"⏸️  Longer input treated as interruption: '{text}'")
-        return InterruptionIntent.PAUSE
-
-    async def handle_vad_event(self, vad_confidence: float) -> dict:
-        """
-        Called when VAD detects voice activity.
-        Returns decision on whether to wait for STT or act immediately.
-        """
-        current_time = asyncio.get_event_loop().time()
-
-        # If agent is idle or listening, no interruption possible
-        if self.current_state in [AgentState.IDLE, AgentState.LISTENING]:
-            return {"action": "ignore", "reason": "Agent not speaking"}
-
-        # Check VAD confidence
-        if vad_confidence < self.vad_threshold:
-            return {"action": "ignore", "reason": f"VAD confidence too low: {vad_confidence:.2f}"}
-
-        # Calculate agent speech duration
-        speech_duration = 0.0
-        if self.speech_start_time:
-            speech_duration = current_time - self.speech_start_time
-
-        # If agent just started speaking, wait for STT to classify
         if speech_duration < self.min_speech_duration:
-            return {
-                "action": "wait_for_stt",
-                "reason": f"Agent speaking for {speech_duration:.1f}s, waiting for semantic analysis",
-                "timeout": self.stt_timeout
-            }
+            # Very short - almost never interrupt
+            return 0.0
 
-        # Agent has been speaking for a while, wait for STT to determine intent
-        return {
-            "action": "wait_for_stt",
-            "reason": "Waiting for semantic classification",
-            "timeout": self.stt_timeout
-        }
+        elif speech_duration < self.short_speech_threshold:
+            # Short speech - be conservative
+            # Linear scale from 0.3 to 0.6
+            progress = (speech_duration - self.min_speech_duration) / \
+                      (self.short_speech_threshold - self.min_speech_duration)
+            return 0.3 + (progress * 0.3)
 
-    async def handle_stt_result(self, text: str, vad_confidence: float) -> dict:
+        elif speech_duration < self.long_speech_threshold:
+            # Normal speech - neutral
+            # Linear scale from 0.6 to 0.8
+            progress = (speech_duration - self.short_speech_threshold) / \
+                      (self.long_speech_threshold - self.short_speech_threshold)
+            return 0.6 + (progress * 0.2)
+
+        else:
+            # Long speech - be more lenient
+            # Agent talking too long, user probably wants to speak
+            return min(0.8 + (speech_duration - self.long_speech_threshold) * 0.02, 1.0)
+
+    def decide(
+        self,
+        text: str,
+        speech_duration: float,
+        audio_features: Optional[AudioFeatures] = None
+    ) -> InterruptionScore:
         """
-        Called when STT provides transcription.
-        Makes final decision on interruption.
+        Make interruption decision with full context.
+
+        Args:
+            text: Transcribed user speech
+            speech_duration: How long agent has been speaking
+            audio_features: Optional audio features for urgency
+
+        Returns:
+            InterruptionScore with detailed reasoning
         """
-        intent = self._classify_intent(text)
+        # Stage 1: Semantic classification
+        intent, semantic_confidence, reason = self.classifier.classify(text)
+        semantic_score = semantic_confidence if intent == InterruptionIntent.INTERRUPT else (1.0 - semantic_confidence)
 
-        decision = {
-            "intent": intent.value,
-            "text": text,
-            "vad_confidence": vad_confidence
-        }
+        # Stage 2: Timing awareness
+        timing_score = self._calculate_timing_score(speech_duration)
 
-        if intent == InterruptionIntent.IGNORE:
-            decision.update({
-                "action": "continue",
-                "reason": f"Soft acknowledgment: '{text}'"
-            })
-        elif intent == InterruptionIntent.HARD_STOP:
-            decision.update({
-                "action": "stop",
-                "reason": f"Hard interruption: '{text}'"
-            })
-        else:  # PAUSE
-            decision.update({
-                "action": "stop",
-                "reason": f"Polite interruption: '{text}'"
-            })
+        # Stage 3: Urgency detection (if audio available)
+        if audio_features:
+            urgency_score = self.audio_analyzer.calculate_urgency(audio_features)
+        else:
+            urgency_score = 0.5  # Neutral if no audio
 
-        logger.info(f"📊 Decision: {decision['action'].upper()} - {decision['reason']}")
-        return decision
+        # Stage 4: Weighted combination
+        # Semantic is most important, timing and urgency are modifiers
+        final_score = (
+            semantic_score * 0.5 +      # Pattern matching
+            timing_score * 0.3 +         # How long agent has spoken
+            urgency_score * 0.2          # How urgent user sounds
+        )
+
+        # Stage 5: Apply dynamic threshold
+        # Adjust threshold based on timing
+        dynamic_threshold = self.base_threshold
+        if speech_duration < self.short_speech_threshold:
+            dynamic_threshold += 0.1  # Higher threshold = harder to interrupt
+        elif speech_duration > self.long_speech_threshold:
+            dynamic_threshold -= 0.1  # Lower threshold = easier to interrupt
+
+        # Stage 6: Final decision
+        should_interrupt = final_score > dynamic_threshold
+        final_intent = InterruptionIntent.INTERRUPT if should_interrupt else InterruptionIntent.IGNORE
+
+        # Calculate overall confidence
+        confidence = abs(final_score - dynamic_threshold) / dynamic_threshold
+        confidence = min(max(confidence, 0.0), 1.0)
+
+        # Build detailed reason
+        detailed_reason = (
+            f"{reason} | "
+            f"Duration: {speech_duration:.1f}s | "
+            f"Scores: semantic={semantic_score:.2f}, timing={timing_score:.2f}, urgency={urgency_score:.2f} | "
+            f"Final: {final_score:.2f} vs threshold={dynamic_threshold:.2f}"
+        )
+
+        logger.info(f"📊 Decision: {final_intent.value.upper()} (confidence={confidence:.2f})")
+        logger.debug(f"   {detailed_reason}")
+
+        return InterruptionScore(
+            semantic_score=semantic_score,
+            timing_score=timing_score,
+            urgency_score=urgency_score,
+            final_score=final_score,
+            decision=final_intent,
+            reason=detailed_reason,
+            confidence=confidence
+        )
 
     def update_agent_state(self, new_state: AgentState):
         """Update current agent state for context tracking"""
@@ -206,7 +353,7 @@ class SemanticInterruptionHandler:
             self.current_state = new_state
 
         if new_state == AgentState.SPEAKING:
-            self.speech_start_time = asyncio.get_event_loop().time()
+            self.speech_start_time = time.time()
         else:
             self.speech_start_time = None
 
@@ -214,69 +361,33 @@ class SemanticInterruptionHandler:
         """Get current agent speech duration"""
         if self.speech_start_time is None:
             return 0.0
-        return asyncio.get_event_loop().time() - self.speech_start_time
+        return time.time() - self.speech_start_time
+
+
+# ============================================================================
+# BACKWARD COMPATIBILITY - Keep simple interface for basic usage
+# ============================================================================
+
+class SemanticInterruptionHandler(TimingAwareInterruptionHandler):
+    """Backward compatible simple handler"""
+    pass
 
 
 class InterruptionManager:
-    """
-    High-level manager that coordinates VAD, STT, and interruption logic.
-    This is what you'll integrate into your agent pipeline.
-    """
+    """Simple manager for basic integration"""
 
-    def __init__(self, handler: SemanticInterruptionHandler):
+    def __init__(self, handler: TimingAwareInterruptionHandler):
         self.handler = handler
 
     async def on_vad_detected(self, vad_confidence: float, stt_callback: Callable) -> bool:
-        """
-        Called when VAD detects voice.
-
-        Args:
-            vad_confidence: VAD confidence score
-            stt_callback: Async function to get STT result
-
-        Returns:
-            bool: True if should stop agent immediately, False otherwise
-        """
-        decision = await self.handler.handle_vad_event(vad_confidence)
-
-        if decision["action"] == "ignore":
-            logger.debug(f"[VAD] Ignoring: {decision['reason']}")
+        """Simplified interface - returns True/False"""
+        if self.handler.current_state != AgentState.SPEAKING:
             return False
 
-        if decision["action"] == "stop_immediately":
-            logger.info(f"[VAD] ⛔ Stopping immediately: {decision['reason']}")
-            return True
-
-        # Wait for STT with timeout
-        if decision["action"] == "wait_for_stt":
-            logger.debug(f"[VAD] ⏳ Waiting for STT: {decision['reason']}")
-            timeout = decision.get("timeout", 0.5)
-
-            try:
-                # Race between STT and timeout
-                stt_text = await asyncio.wait_for(
-                    stt_callback(),
-                    timeout=timeout
-                )
-
-                # Got STT result, make semantic decision
-                final_decision = await self.handler.handle_stt_result(
-                    stt_text, vad_confidence
-                )
-
-                should_stop = final_decision["action"] == "stop"
-                action_icon = "🛑" if should_stop else "✅"
-                logger.info(f"[STT] {action_icon} {final_decision['reason']}")
-                return should_stop
-
-            except asyncio.TimeoutError:
-                # STT took too long, make conservative decision
-                speech_duration = self.handler.get_speech_duration()
-                if speech_duration > 3.0:
-                    logger.warning(f"[STT TIMEOUT] ⚠️  Agent spoke {speech_duration:.1f}s, stopping")
-                    return True
-                else:
-                    logger.warning(f"[STT TIMEOUT] ⚠️  Agent spoke {speech_duration:.1f}s, continuing")
-                    return False
-
-        return False
+        try:
+            text = await asyncio.wait_for(stt_callback(), timeout=0.5)
+            speech_duration = self.handler.get_speech_duration()
+            score = self.handler.decide(text, speech_duration)
+            return score.decision == InterruptionIntent.INTERRUPT
+        except asyncio.TimeoutError:
+            return False
