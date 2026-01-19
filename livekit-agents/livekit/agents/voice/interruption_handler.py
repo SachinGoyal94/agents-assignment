@@ -127,40 +127,74 @@ class AudioAnalyzer:
 class AdvancedInterruptionClassifier:
     """Advanced semantic classifier with pattern matching and confidence scoring."""
 
-    # Soft acknowledgments (should NOT interrupt)
-    SOFT_ACKNOWLEDGMENTS = {
-        r'\b(yeah|yep|yes|uh-huh|mm-hmm|mhmm|okay|ok|right|sure|got it)\b': 0.9,
-        r'\b(i see|makes sense|understood|alright|cool|nice)\b': 0.85,
-        r'\b(go on|continue|keep going)\b': 0.95,
-        r'\b(interesting|really|wow|oh|ah)\b': 0.8,
-    }
+    def __init__(
+        self,
+        soft_words: list[str] | None = None,
+        hard_words: list[str] | None = None,
+        polite_phrases: list[str] | None = None,
+    ):
+        """
+        Initialize classifier with configurable word lists.
 
-    # Hard interruptions (SHOULD interrupt)
-    HARD_INTERRUPTIONS = {
-        r'\b(wait|hold on|stop|hang on)\b': 0.95,
-        r'\b(but|however|actually)\b': 0.85,
-        r'\b(excuse me|sorry|one sec|one second)\b': 0.9,
-        r'\bno\b(?!\s+problem)': 0.85,
-        r'\b(what|huh|pardon)\b': 0.7,
-    }
+        Args:
+            soft_words: List of words to ignore (e.g., ['yeah', 'ok', 'hmm'])
+            hard_words: List of words that trigger interruption (e.g., ['wait', 'stop'])
+            polite_phrases: List of polite phrases that trigger interruption
+        """
+        # Default soft acknowledgments
+        default_soft = [
+            'yeah', 'yep', 'yes', 'uh-huh', 'mm-hmm', 'mhmm', 'okay', 'ok',
+            'right', 'sure', 'got it', 'i see', 'makes sense', 'understood',
+            'alright', 'cool', 'nice', 'go on', 'continue', 'keep going',
+            'interesting', 'really', 'wow', 'oh', 'ah', 'hmm'
+        ]
 
-    # Polite interruptions (SHOULD interrupt)
-    POLITE_INTERRUPTIONS = {
-        r'\b(quick question|can i ask|may i|could you)\b': 0.9,
-        r'\b(before you|let me|i want to|i need to)\b': 0.85,
-        r'\b(just to clarify|to be clear|one thing)\b': 0.8,
-    }
+        # Default hard interruptions
+        default_hard = [
+            'wait', 'hold on', 'stop', 'hang on', 'but', 'however',
+            'actually', 'excuse me', 'sorry', 'one sec', 'one second',
+            'no', 'what', 'pardon'  # Removed 'huh' to avoid conflict with 'uh-huh'
+        ]
 
-    def __init__(self):
-        # Compile patterns with confidence scores
-        self.soft_patterns = [(re.compile(p, re.IGNORECASE), c)
-                             for p, c in self.SOFT_ACKNOWLEDGMENTS.items()]
-        self.hard_patterns = [(re.compile(p, re.IGNORECASE), c)
-                             for p, c in self.HARD_INTERRUPTIONS.items()]
-        self.polite_patterns = [(re.compile(p, re.IGNORECASE), c)
-                               for p, c in self.POLITE_INTERRUPTIONS.items()]
+        # Default polite interruptions
+        default_polite = [
+            'quick question', 'can i ask', 'may i', 'could you',
+            'before you', 'let me', 'i want to', 'i need to',
+            'just to clarify', 'to be clear', 'one thing'
+        ]
+
+        self.soft_words = soft_words or default_soft
+        self.hard_words = hard_words or default_hard
+        self.polite_phrases = polite_phrases or default_polite
+
+        # Build regex patterns
+        self._build_patterns()
 
         logger.debug("Advanced semantic classifier initialized")
+
+    def _build_patterns(self):
+        """Build regex patterns from word lists"""
+        # Sort by length (longest first) to match multi-word phrases before single words
+        soft_sorted = sorted(self.soft_words, key=len, reverse=True)
+        hard_sorted = sorted(self.hard_words, key=len, reverse=True)
+        polite_sorted = sorted(self.polite_phrases, key=len, reverse=True)
+
+        # Build patterns - escape but preserve word boundaries
+        self.soft_patterns = []
+        for word in soft_sorted:
+            # Replace hyphens with optional space or hyphen
+            pattern = re.escape(word).replace(r'\-', r'[\s\-]')
+            self.soft_patterns.append((re.compile(rf'\b{pattern}\b', re.IGNORECASE), 0.9))
+
+        self.hard_patterns = []
+        for word in hard_sorted:
+            pattern = re.escape(word).replace(r'\-', r'[\s\-]')
+            self.hard_patterns.append((re.compile(rf'\b{pattern}\b', re.IGNORECASE), 0.95))
+
+        self.polite_patterns = []
+        for phrase in polite_sorted:
+            pattern = re.escape(phrase).replace(r'\-', r'[\s\-]')
+            self.polite_patterns.append((re.compile(rf'\b{pattern}\b', re.IGNORECASE), 0.9))
 
     def classify(self, text: str) -> tuple[InterruptionIntent, float, str]:
         """
@@ -174,7 +208,9 @@ class AdvancedInterruptionClassifier:
 
         text_lower = text.lower().strip()
 
-        # Check hard interruptions (highest priority)
+        # CRITICAL: Check hard interruptions FIRST
+        # This ensures "Yeah wait a second" interrupts (because of "wait")
+        # Even if "yeah" is present, "wait" takes priority
         for pattern, confidence in self.hard_patterns:
             if pattern.search(text_lower):
                 return InterruptionIntent.INTERRUPT, confidence, f"Hard interruption pattern matched"
@@ -184,10 +220,11 @@ class AdvancedInterruptionClassifier:
             if pattern.search(text_lower):
                 return InterruptionIntent.INTERRUPT, confidence, f"Polite interruption pattern matched"
 
-        # Check soft acknowledgments
+        # Check soft acknowledgments (only if no interruptions found)
         for pattern, confidence in self.soft_patterns:
             if pattern.search(text_lower):
                 return InterruptionIntent.IGNORE, confidence, f"Soft acknowledgment pattern matched"
+
 
         # Word count heuristic
         word_count = len(text_lower.split())
@@ -210,6 +247,9 @@ class TimingAwareInterruptionHandler:
         short_speech_threshold: float = 3.0,
         long_speech_threshold: float = 8.0,
         base_threshold: float = 0.7,
+        soft_words: list[str] | None = None,
+        hard_words: list[str] | None = None,
+        polite_phrases: list[str] | None = None,
     ):
         """
         Args:
@@ -217,13 +257,20 @@ class TimingAwareInterruptionHandler:
             short_speech_threshold: Time below which we're more conservative
             long_speech_threshold: Time above which we're more lenient
             base_threshold: Base confidence threshold for interruption (0-1)
+            soft_words: List of words to ignore (e.g., ['yeah', 'ok', 'hmm'])
+            hard_words: List of words that trigger interruption
+            polite_phrases: List of polite phrases that trigger interruption
         """
         self.min_speech_duration = min_speech_duration
         self.short_speech_threshold = short_speech_threshold
         self.long_speech_threshold = long_speech_threshold
         self.base_threshold = base_threshold
 
-        self.classifier = AdvancedInterruptionClassifier()
+        self.classifier = AdvancedInterruptionClassifier(
+            soft_words=soft_words,
+            hard_words=hard_words,
+            polite_phrases=polite_phrases,
+        )
         self.audio_analyzer = AudioAnalyzer()
 
         self.current_state = AgentState.IDLE
@@ -280,6 +327,20 @@ class TimingAwareInterruptionHandler:
         """
         # Stage 1: Semantic classification
         intent, semantic_confidence, reason = self.classifier.classify(text)
+
+        # CRITICAL: Hard interruptions always win, regardless of timing
+        # This ensures "wait", "stop", etc. always interrupt
+        if intent == InterruptionIntent.INTERRUPT and semantic_confidence >= 0.9:
+            return InterruptionScore(
+                semantic_score=semantic_confidence,
+                timing_score=1.0,  # Override timing
+                urgency_score=1.0,  # Override urgency
+                final_score=semantic_confidence,
+                decision=InterruptionIntent.INTERRUPT,
+                reason=f"Hard interruption detected: {reason}",
+                confidence=semantic_confidence,
+            )
+
         semantic_score = semantic_confidence if intent == InterruptionIntent.INTERRUPT else (1.0 - semantic_confidence)
 
         # Stage 2: Timing awareness

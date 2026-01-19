@@ -38,6 +38,13 @@ from livekit.plugins import deepgram, google, cartesia, silero
 env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 from livekit.agents.voice.interruption_handler import (
     TimingAwareInterruptionHandler,
     InterruptionIntent,
@@ -45,12 +52,26 @@ from livekit.agents.voice.interruption_handler import (
     AgentState,
 )
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
-logger = logging.getLogger(__name__)
+try:
+    from interruption_config import (
+        SOFT_ACKNOWLEDGMENTS,
+        HARD_INTERRUPTIONS,
+        POLITE_INTERRUPTIONS,
+        MIN_SPEECH_DURATION,
+        SHORT_SPEECH_THRESHOLD,
+        LONG_SPEECH_THRESHOLD,
+        BASE_THRESHOLD,
+    )
+    logger.info("Loaded custom interruption configuration")
+except ImportError:
+    SOFT_ACKNOWLEDGMENTS = None
+    HARD_INTERRUPTIONS = None
+    POLITE_INTERRUPTIONS = None
+    MIN_SPEECH_DURATION = 1.0
+    SHORT_SPEECH_THRESHOLD = 3.0
+    LONG_SPEECH_THRESHOLD = 8.0
+    BASE_THRESHOLD = 0.7
+    logger.info("Using default interruption configuration")
 
 
 class AdvancedInterruptionSession(AgentSession):
@@ -62,12 +83,14 @@ class AdvancedInterruptionSession(AgentSession):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Initialize advanced handler
         self.interruption_handler = TimingAwareInterruptionHandler(
-            min_speech_duration=1.0,      # Don't interrupt first 1 second
-            short_speech_threshold=3.0,   # Be conservative before 3 seconds
-            long_speech_threshold=8.0,    # Be lenient after 8 seconds
-            base_threshold=0.7,           # Base confidence threshold
+            min_speech_duration=MIN_SPEECH_DURATION,
+            short_speech_threshold=SHORT_SPEECH_THRESHOLD,
+            long_speech_threshold=LONG_SPEECH_THRESHOLD,
+            base_threshold=BASE_THRESHOLD,
+            soft_words=SOFT_ACKNOWLEDGMENTS,
+            hard_words=HARD_INTERRUPTIONS,
+            polite_phrases=POLITE_INTERRUPTIONS,
         )
 
         self.audio_analyzer = AudioAnalyzer()
