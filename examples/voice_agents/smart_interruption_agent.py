@@ -1,12 +1,10 @@
 """
 Advanced Smart Interruption Agent
-Location: examples/voice_agents/smart_interruption_agent.py
 
 Features:
 - Timing-aware interruption detection
 - Audio urgency analysis
 - Confidence scoring
-- Detailed decision logging
 """
 
 import sys
@@ -20,36 +18,31 @@ for _p in _candidates:
         sys.path.insert(0, str(_p))
         break
 
-import asyncio
 import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-import re
 from typing import Optional
 import numpy as np
 
-from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     WorkerOptions,
     cli,
-    llm,
 )
 from livekit.plugins import deepgram, google, cartesia, silero
 
-# Load environment
+
 env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# Import our advanced handler
 from livekit.agents.voice.interruption_handler import (
     TimingAwareInterruptionHandler,
     InterruptionIntent,
-    AudioFeatures,
     AudioAnalyzer,
+    AgentState,
 )
 
 # Setup logging
@@ -79,9 +72,21 @@ class AdvancedInterruptionSession(AgentSession):
 
         self.audio_analyzer = AudioAnalyzer()
         self._last_user_audio: Optional[np.ndarray] = None
+        self._agent_speaking = False
 
-        logger.info("✅ Advanced interruption session initialized")
-        logger.info("   Features: Timing-aware + Urgency detection + Confidence scoring")
+        logger.info("Advanced interruption session initialized")
+
+    async def _on_agent_speech_started(self):
+        """Called when agent starts speaking"""
+        self._agent_speaking = True
+        self.interruption_handler.update_agent_state(AgentState.SPEAKING)
+        logger.debug("Agent started speaking")
+
+    async def _on_agent_speech_stopped(self):
+        """Called when agent stops speaking"""
+        self._agent_speaking = False
+        self.interruption_handler.update_agent_state(AgentState.IDLE)
+        logger.debug("Agent stopped speaking")
 
     async def _should_interrupt(self, transcript: str) -> bool:
         """
@@ -100,7 +105,7 @@ class AdvancedInterruptionSession(AgentSession):
                     self._last_user_audio,
                     sample_rate=16000
                 )
-                logger.debug(f"🎤 Audio features: energy={audio_features.rms_energy:.3f}, "
+                logger.debug(f"Audio features: energy={audio_features.rms_energy:.3f}, "
                            f"zcr={audio_features.zero_crossing_rate:.3f}, "
                            f"duration={audio_features.duration:.2f}s")
             except Exception as e:
@@ -113,17 +118,16 @@ class AdvancedInterruptionSession(AgentSession):
             audio_features=audio_features
         )
 
-        # Log decision with color coding
         if score.decision == InterruptionIntent.INTERRUPT:
-            logger.info(f"🛑 INTERRUPTING (confidence={score.confidence:.2f})")
-            logger.info(f"   User said: '{transcript}'")
-            logger.info(f"   Agent spoke for: {speech_duration:.1f}s")
-            logger.info(f"   Scores: semantic={score.semantic_score:.2f}, "
+            logger.info(f"INTERRUPTING (confidence={score.confidence:.2f})")
+            logger.info(f"User said: '{transcript}'")
+            logger.info(f"Agent spoke for: {speech_duration:.1f}s")
+            logger.info(f"Scores: semantic={score.semantic_score:.2f}, "
                        f"timing={score.timing_score:.2f}, urgency={score.urgency_score:.2f}")
         else:
-            logger.info(f"✅ CONTINUING (confidence={score.confidence:.2f})")
-            logger.info(f"   User said: '{transcript}' (acknowledged)")
-            logger.info(f"   Agent continues speaking...")
+            logger.info(f"CONTINUING (confidence={score.confidence:.2f})")
+            logger.info(f"User said: '{transcript}' (acknowledged)")
+            logger.info(f"Agent continues speaking")
 
         return score.decision == InterruptionIntent.INTERRUPT
 
@@ -140,9 +144,8 @@ class AdvancedInterruptionSession(AgentSession):
 async def entrypoint(ctx: JobContext):
     """Main agent with advanced interruption handling"""
     await ctx.connect()
-    logger.info("🚀 Connected to LiveKit room: %s", ctx.room.name)
+    logger.info("Connected to LiveKit room: %s", ctx.room.name)
 
-    # Configure agent with longer responses for testing
     agent = Agent(
         instructions=(
             "You are a helpful AI assistant. "
@@ -152,30 +155,34 @@ async def entrypoint(ctx: JobContext):
         )
     )
 
-    # Initialize providers
-    logger.info("🎯 Initializing providers...")
+    logger.info("Initializing providers...")
 
     voice_activity_detector = silero.VAD.load()
-    logger.info("✅ VAD: Silero (local)")
+    logger.info("VAD: Silero")
 
     speech_to_text = deepgram.STT(model="nova-3")
-    logger.info("✅ STT: Deepgram Nova-3")
+    logger.info("STT: Deepgram Nova-3")
 
     language_model = google.LLM(
         model="gemini-2.5-flash-lite-preview-09-2025",
         temperature=0.7,
     )
-    logger.info("✅ LLM: Google Gemini 2.0 Flash")
+    logger.info("LLM: gemini-2.5-flash-lite-preview-09-2025")
 
-    # Use Cartesia if available, fallback to Google TTS
+    text_to_speech = None
     if os.getenv("CARTESIA_API_KEY"):
-        text_to_speech = cartesia.TTS()
-        logger.info("✅ TTS: Cartesia (streaming)")
-    else:
-        text_to_speech = google.TTS()
-        logger.info("✅ TTS: Google Cloud TTS")
+        try:
+            text_to_speech = cartesia.TTS()
+            logger.info("TTS: Cartesia")
+            logger.info("Note: If you get 402 errors, your Cartesia account may need credits")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Cartesia TTS: {e}")
+            logger.info("Falling back to Google Cloud TTS")
 
-    # Use advanced session
+    if text_to_speech is None:
+        text_to_speech = google.TTS()
+        logger.info("TTS: Google Cloud TTS")
+
     session = AdvancedInterruptionSession(
         vad=voice_activity_detector,
         stt=speech_to_text,
@@ -183,10 +190,10 @@ async def entrypoint(ctx: JobContext):
         tts=text_to_speech,
     )
 
-    logger.info("🎬 Starting advanced interruption agent...")
+    logger.info("Starting agent...")
     await session.start(agent=agent, room=ctx.room)
 
-    logger.info("👋 Generating greeting...")
+    logger.info("Generating greeting...")
     await session.generate_reply(
         instructions=(
             "Greet the user warmly and explain you're demonstrating advanced interruption handling. "
@@ -197,60 +204,9 @@ async def entrypoint(ctx: JobContext):
         )
     )
 
-    logger.info("✅ Agent LIVE with ADVANCED interruption detection!")
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("🎯 TESTING GUIDE - Advanced Interruption Detection")
-    logger.info("=" * 80)
-    logger.info("")
-    logger.info("🕐 TIMING AWARENESS:")
-    logger.info("   • First 1 second:  Hard to interrupt (agent just started)")
-    logger.info("   • 1-3 seconds:     Conservative (soft acks ignored)")
-    logger.info("   • 3-8 seconds:     Normal sensitivity")
-    logger.info("   • 8+ seconds:      More lenient (agent talking too long)")
-    logger.info("")
-    logger.info("📢 WHILE AGENT IS SPEAKING:")
-    logger.info("")
-    logger.info("   ✨ SOFT ACKS (will be ignored):")
-    logger.info("      'yeah', 'okay', 'mhmm', 'uh-huh', 'I see', 'right'")
-    logger.info("")
-    logger.info("   🛑 HARD INTERRUPTS (will stop agent):")
-    logger.info("      'wait', 'hold on', 'stop', 'but', 'actually'")
-    logger.info("      Say these LOUDLY or SHARPLY for even higher chance!")
-    logger.info("")
-    logger.info("   ⏸️  POLITE INTERRUPTS (will stop agent):")
-    logger.info("      'can I ask', 'quick question', 'before you continue'")
-    logger.info("")
-    logger.info("🎤 URGENCY DETECTION:")
-    logger.info("   • Louder voice = higher urgency score")
-    logger.info("   • Sharper tone = higher urgency score")
-    logger.info("   • Quick interjection = higher urgency score")
-    logger.info("")
-    logger.info("📊 Watch the terminal for detailed scoring:")
-    logger.info("   • Semantic score (pattern matching)")
-    logger.info("   • Timing score (based on agent speech duration)")
-    logger.info("   • Urgency score (from audio features)")
-    logger.info("   • Final decision with confidence level")
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("")
-    logger.info("💡 PRO TIP: Ask the agent to explain something complex, then try")
-    logger.info("            interrupting at different points to see how timing affects decisions!")
-    logger.info("=" * 80)
+    logger.info("Agent is live")
 
 
 if __name__ == "__main__":
-    logger.info("=" * 80)
-    logger.info("🤖 Advanced Smart Interruption Agent")
-    logger.info("=" * 80)
-    logger.info("✨ Features:")
-    logger.info("  • Timing-aware interruption detection")
-    logger.info("  • Audio urgency analysis (volume, pitch, duration)")
-    logger.info("  • Confidence scoring (not just binary)")
-    logger.info("  • Adaptive thresholds based on context")
-    logger.info("  • Detailed decision logging")
-    logger.info("=" * 80)
-    logger.info("💡 Usage: python smart_interruption_agent.py console")
-    logger.info("=" * 80)
 
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

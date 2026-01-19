@@ -1,12 +1,11 @@
 """
-Advanced Interruption Handler with Timing Awareness + Urgency Detection
-Location: livekit-agents/livekit/agents/voice/interruption_handler.py
+Advanced Interruption Handler with Timing Awareness and Urgency Detection
 
-This is a PRODUCTION-GRADE interruption system that considers:
-1. Semantic patterns (regex)
-2. Agent speech duration (timing)
-3. Audio urgency features (volume, pitch, rate)
-4. Confidence scoring (not binary)
+Provides production-grade interruption handling that considers:
+- Semantic patterns (regex-based classification)
+- Agent speech duration (timing awareness)
+- Audio urgency features (volume, pitch, rate)
+- Confidence scoring for nuanced decisions
 """
 
 import asyncio
@@ -15,7 +14,7 @@ import logging
 import time
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -57,10 +56,7 @@ class AudioFeatures:
 
 
 class AudioAnalyzer:
-    """
-    Analyzes audio features to detect urgency in speech.
-    Uses simple signal processing - no ML models needed for speed.
-    """
+    """Analyzes audio features to detect urgency in speech using signal processing."""
 
     @staticmethod
     def extract_features(audio_data: np.ndarray, sample_rate: int = 16000) -> AudioFeatures:
@@ -129,9 +125,7 @@ class AudioAnalyzer:
 
 
 class AdvancedInterruptionClassifier:
-    """
-    Advanced semantic classifier with pattern matching and confidence scoring.
-    """
+    """Advanced semantic classifier with pattern matching and confidence scoring."""
 
     # Soft acknowledgments (should NOT interrupt)
     SOFT_ACKNOWLEDGMENTS = {
@@ -166,7 +160,7 @@ class AdvancedInterruptionClassifier:
         self.polite_patterns = [(re.compile(p, re.IGNORECASE), c)
                                for p, c in self.POLITE_INTERRUPTIONS.items()]
 
-        logger.info("✅ Advanced semantic classifier initialized")
+        logger.debug("Advanced semantic classifier initialized")
 
     def classify(self, text: str) -> tuple[InterruptionIntent, float, str]:
         """
@@ -206,11 +200,8 @@ class AdvancedInterruptionClassifier:
 
 class TimingAwareInterruptionHandler:
     """
-    Production-grade interruption handler with:
-    - Semantic classification
-    - Timing awareness
-    - Urgency detection
-    - Confidence scoring
+    Production-grade interruption handler with semantic classification,
+    timing awareness, urgency detection, and confidence scoring.
     """
 
     def __init__(
@@ -238,8 +229,7 @@ class TimingAwareInterruptionHandler:
         self.current_state = AgentState.IDLE
         self.speech_start_time: Optional[float] = None
 
-        logger.info(f"✅ Timing-aware interruption handler initialized")
-        logger.info(f"   Settings: min={min_speech_duration}s, short<{short_speech_threshold}s, long>{long_speech_threshold}s")
+        logger.info(f"Timing-aware interruption handler initialized (min={min_speech_duration}s, short<{short_speech_threshold}s, long>{long_speech_threshold}s)")
 
     def _calculate_timing_score(self, speech_duration: float) -> float:
         """
@@ -333,8 +323,8 @@ class TimingAwareInterruptionHandler:
             f"Final: {final_score:.2f} vs threshold={dynamic_threshold:.2f}"
         )
 
-        logger.info(f"📊 Decision: {final_intent.value.upper()} (confidence={confidence:.2f})")
-        logger.debug(f"   {detailed_reason}")
+        logger.info(f"Decision: {final_intent.value.upper()} (confidence={confidence:.2f})")
+        logger.debug(f"{detailed_reason}")
 
         return InterruptionScore(
             semantic_score=semantic_score,
@@ -349,7 +339,7 @@ class TimingAwareInterruptionHandler:
     def update_agent_state(self, new_state: AgentState):
         """Update current agent state for context tracking"""
         if self.current_state != new_state:
-            logger.debug(f"🔄 State change: {self.current_state.value} → {new_state.value}")
+            logger.debug(f"State change: {self.current_state.value} → {new_state.value}")
             self.current_state = new_state
 
         if new_state == AgentState.SPEAKING:
@@ -364,9 +354,6 @@ class TimingAwareInterruptionHandler:
         return time.time() - self.speech_start_time
 
 
-# ============================================================================
-# BACKWARD COMPATIBILITY - Keep simple interface for basic usage
-# ============================================================================
 
 class SemanticInterruptionHandler(TimingAwareInterruptionHandler):
     """Backward compatible simple handler"""
